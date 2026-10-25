@@ -153,6 +153,7 @@ __global__ void softmax_warp_forward(output_t *dst, const input_t *src, int batc
     warp_reduce<acc_t, WARP_BATCH, WARP_SIZE, Max>(max_value);
 
     acc_t sum[WARP_BATCH] { 0.0f };
+    acc_t tail[WARP_BATCH] { 0.0f };
     #pragma unroll
     for (int i = 0;  i < WARP_BATCH;  ++i) {
         int batch_element_count = (i >= local_batches) ? 0 : element_count;
@@ -160,7 +161,9 @@ __global__ void softmax_warp_forward(output_t *dst, const input_t *src, int batc
         for (int it = 0;  it < WARP_ITERATIONS;  ++it) {
             if (!is_masked) {
                 if (is_log_softmax) {
-                    sum[i] += std::exp(elements[i][it] - max_value[i]);
+                    acc_t exp_value = std::exp(elements[i][it] - max_value[i]);
+                    sum[i] += exp_value;
+                    if (elements[i][it] != max_value[i]) tail[i] += exp_value;
                 } else {
                     elements[i][it] = std::exp(elements[i][it] - max_value[i]);
                     sum[i] += elements[i][it];
@@ -174,7 +177,9 @@ __global__ void softmax_warp_forward(output_t *dst, const input_t *src, int batc
                 if (valid) {
                     if (!mask[idx]) {
                         if (is_log_softmax) {
-                            sum[i] += std::exp(elements[i][it] - max_value[i]);
+                            acc_t exp_value = std::exp(elements[i][it] - max_value[i]);
+                            sum[i] += exp_value;
+                            if (elements[i][it] != max_value[i]) tail[i] += exp_value;
                         } else {
                             elements[i][it] = std::exp(elements[i][it] - max_value[i]);
                             sum[i] += elements[i][it];
@@ -196,19 +201,6 @@ __global__ void softmax_warp_forward(output_t *dst, const input_t *src, int batc
     warp_reduce<acc_t, WARP_BATCH, WARP_SIZE, Add>(sum);
 
     if constexpr (is_log_softmax) {
-        acc_t tail[WARP_BATCH] { 0.0f };
-        for (int i = 0; i < WARP_BATCH; ++i) {
-            if (sum[i] != 1) continue;
-            for (int it = 0; it < WARP_ITERATIONS; ++it) {
-                int element_index = local_idx + it * WARP_SIZE;
-                if (element_index >= element_count) continue;
-                int mask_idx = it * WARP_SIZE + (is_transformer_mask ? 0 : i * element_count);
-                if ((!is_masked || !mask[mask_idx]) && elements[i][it] != max_value[i]) {
-                    tail[i] += std::exp(elements[i][it] - max_value[i]);
-                }
-            }
-        }
-        // Several logical warps can share one hardware warp.
         warp_reduce<acc_t, WARP_BATCH, WARP_SIZE, Add>(tail);
         for (int i = 0; i < WARP_BATCH; ++i) {
             sum[i] = sum[i] == 1 ? std::log1p(tail[i]) : std::log(sum[i]);

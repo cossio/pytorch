@@ -288,19 +288,6 @@ T spatialBlockReduceX(T *shared, T val) {
   return shared[0];
 }
 
-template <typename scalar_t, typename accscalar_t, typename index_t>
-__device__ __forceinline__ accscalar_t log_softmax_tail(
-    const scalar_t* input, index_t classes, index_t stride, accscalar_t max_value) {
-  accscalar_t tail = 0;
-  for (int64_t d = threadIdx.x; d < classes; d += blockDim.x) {
-    auto value = static_cast<accscalar_t>(input[d * stride]);
-    if (value != max_value) {
-      tail += std::exp(value - max_value);
-    }
-  }
-  return tail;
-}
-
 template <typename scalar_t, typename accscalar_t, typename outscalar_t, typename index_t, template<typename, typename, typename> class Epilogue>
 __global__ void cunn_SpatialSoftMaxForward(
     outscalar_t *output, const scalar_t *input,
@@ -331,18 +318,19 @@ __global__ void cunn_SpatialSoftMaxForward(
         max_input = spatialBlockReduceX<accscalar_t, Max>(sdata,max_input);
 
         accscalar_t sum = 0;
-        for (index_t d = threadIdx.x; d < dim_size; d += blockDim.x)
-          sum += std::exp(static_cast<accscalar_t>(input[data_offset + d * dim_stride])
-                 - max_input);
+        accscalar_t tail = 0;
+        for (index_t d = threadIdx.x; d < dim_size; d += blockDim.x) {
+          auto value = static_cast<accscalar_t>(input[data_offset + d * dim_stride]);
+          auto exp_value = std::exp(value - max_input);
+          sum += exp_value;
+          if constexpr (Epilogue<scalar_t, accscalar_t, outscalar_t>::is_log_softmax) {
+            if (value != max_input) tail += exp_value;
+          }
+        }
         sum = spatialBlockReduceX<accscalar_t, Add>(sdata, sum);
 
         Epilogue<scalar_t, accscalar_t, outscalar_t> epilogue(max_input, sum);
         if constexpr (Epilogue<scalar_t, accscalar_t, outscalar_t>::is_log_softmax) {
-          accscalar_t tail = 0;
-          if (sum == 1) {
-            tail = log_softmax_tail(input + data_offset, dim_size, dim_stride, max_input);
-          }
-          // The barrier must also be reached by rows whose sum is not one.
           tail = spatialBlockReduceX<accscalar_t, Add>(sdata, tail);
           if (sum == 1) {
             epilogue.logsum = std::log1p(tail);
@@ -357,14 +345,19 @@ __global__ void cunn_SpatialSoftMaxForward(
           max_input = Max<accscalar_t>()(max_input, value);
         }
         accscalar_t sum = 0;
-        for (index_t d = threadIdx.x; d < dim_size; d += blockDim.x)
-          sum += std::exp(static_cast<accscalar_t>(input[data_offset + d * dim_stride])
-                 - max_input);
+        accscalar_t tail = 0;
+        for (index_t d = threadIdx.x; d < dim_size; d += blockDim.x) {
+          auto value = static_cast<accscalar_t>(input[data_offset + d * dim_stride]);
+          auto exp_value = std::exp(value - max_input);
+          sum += exp_value;
+          if constexpr (Epilogue<scalar_t, accscalar_t, outscalar_t>::is_log_softmax) {
+            if (value != max_input) tail += exp_value;
+          }
+        }
         Epilogue<scalar_t, accscalar_t, outscalar_t> epilogue(max_input, sum);
         if constexpr (Epilogue<scalar_t, accscalar_t, outscalar_t>::is_log_softmax) {
           if (sum == 1) {
-            epilogue.logsum = std::log1p(log_softmax_tail(
-                input + data_offset, dim_size, dim_stride, max_input));
+            epilogue.logsum = std::log1p(tail);
           }
         }
         for (index_t d = threadIdx.x; d < dim_size; d += blockDim.x)
@@ -535,7 +528,13 @@ __device__ __forceinline__ void correct_log_softmax_normalizer(
     accscalar_t sum, accscalar_t* sdata) {
   if constexpr (Epilogue::is_log_softmax) {
     if (sum == 1) {
-      auto tail = log_softmax_tail(input, classes, index_t(1), epilogue.max_input);
+      accscalar_t tail = 0;
+      for (int64_t d = threadIdx.x; d < classes; d += blockDim.x) {
+        auto value = static_cast<accscalar_t>(input[d]);
+        if (value != epilogue.max_input) {
+          tail += std::exp(value - epilogue.max_input);
+        }
+      }
       tail = blockReduceWarp<Add, accscalar_t>(
           sdata, tail, Add<accscalar_t>(), accscalar_t(0));
       epilogue.logsum = std::log1p(tail);
