@@ -28,6 +28,45 @@ int64_t vec_log_softmax_lastdim_chunk_size(int64_t grain_size, int64_t outer_siz
 }
 
 template <typename scalar_t>
+void correct_log_softmax_normalizer(
+    const scalar_t* input,
+    const scalar_t* max_data,
+    scalar_t* log_sum_data,
+    int64_t dim_size,
+    int64_t stride,
+    int64_t size) {
+  if (std::none_of(log_sum_data, log_sum_data + size, [](scalar_t x) { return x == 0; })) {
+    return;
+  }
+  using Vec = vec::Vectorized<scalar_t>;
+  auto tail = std::make_unique<scalar_t[]>(size);
+  for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {
+    const auto* values = input + dim_idx * stride;
+    int64_t d = 0;
+    for (; d < size - (size % Vec::size()); d += Vec::size()) {
+      auto value = Vec::loadu(values + d);
+      auto max = Vec::loadu(max_data + d);
+      auto sum = Vec::loadu(tail.get() + d);
+      sum += Vec::blendv((value - max).exp(), Vec(0), value == max);
+      sum.store(tail.get() + d);
+    }
+    for (; d < size; d++) {
+      if (values[d] != max_data[d]) {
+        tail[d] += std::exp(values[d] - max_data[d]);
+      }
+    }
+  }
+  vec::map2(
+      [](Vec log_sum, Vec tail_sum) {
+        return Vec::blendv(log_sum, tail_sum.log1p(), log_sum == Vec(0));
+      },
+      log_sum_data,
+      log_sum_data,
+      tail.get(),
+      size);
+}
+
+template <typename scalar_t>
 void serial_vec_log_softmax_lastdim_range(
     const scalar_t* input_data_base,
     scalar_t* output_data_base,
@@ -79,6 +118,20 @@ void serial_vec_log_softmax_lastdim_range(
       scalar_t* output_data = output_data_base + i * dim_size;
       scalar_t tmp_sum = tmp_sum_scalar[j];
       scalar_t max_input = max_input_arr[j];
+
+      if (tmp_sum == 0) {
+        // If the normalizer rounded to one, the maximum is unique.
+        // Sum the other exponentials separately to retain the small loss.
+        auto tail = vec::map_reduce_all<scalar_t>(
+            [max_input](Vec x) {
+              return Vec::blendv(
+                  (x - Vec(max_input)).exp(), Vec(0), x == Vec(max_input));
+            },
+            [](Vec& x, Vec& y) { return x + y; },
+            input_data,
+            dim_size);
+        tmp_sum = std::log1p(tail);
+      }
 
       // It's necessary to keep the order of the operations below.
       // In some cases that input is large digits and the difference
@@ -189,6 +242,10 @@ serial_vec_logsoftmax_range(
 
     // apply log
     vec::map([](Vec x) { return x.log(); }, tmp_sum_data, tmp_sum_data, size);
+
+    correct_log_softmax_normalizer(
+        input_data_base + outer_idx * dim_size * inner_size + inner_idx_begin,
+        input_max_data, tmp_sum_data, dim_size, inner_size, size);
 
     // compute x - max - sum
     for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {
@@ -308,6 +365,9 @@ serial_vec_logsoftmax_range(
 
     // apply log
     vec::map([](fVec x) { return x.log(); }, tmp_sum_data, tmp_sum_data, size);
+
+    correct_log_softmax_normalizer(
+        input_buffer_data, input_max_data, tmp_sum_data, dim_size, chunk_size, size);
 
     // compute x - max - sum
     for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {

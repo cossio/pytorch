@@ -4859,6 +4859,18 @@ for dtype in (torch.int32, torch.int64):
 
         self.common(fn, (torch.randn(8, 8), torch.randn(8, 8)))
 
+    def test_cross_entropy_no_collapse(self):
+        logits = torch.tensor(
+            [[25.0, 0.0, 0.0]], device=self.device, requires_grad=True
+        )
+        target = torch.zeros(1, device=self.device, dtype=torch.long)
+        loss = torch.compile(F.cross_entropy, fullgraph=True)(logits, target)
+        (grad,) = torch.autograd.grad(loss, logits)
+        tail = 2 * math.exp(-25)
+        expected_grad = logits.new_tensor([[-tail, tail / 2, tail / 2]]) / (1 + tail)
+        self.assertEqual(loss, loss.new_tensor(math.log1p(tail)), atol=0, rtol=2e-6)
+        self.assertEqual(grad, expected_grad, atol=0, rtol=2e-6)
+
     def test_transpose(self):
         def fn(a, b):
             return (

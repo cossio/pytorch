@@ -180,7 +180,19 @@ inline void _vec_host_softmax_backward_lastdim(
             auto sum = vec::reduce_all<scalar_t>(
                 [](Vec& x, Vec& y) { return x + y; }, grad_data, dim_size);
             vec::map2(
-                [sum](Vec x, Vec y) { return x - ((y.exp()) * Vec(sum)); },
+                [sum](Vec x, Vec y) {
+                  auto result = x - y.exp() * Vec(sum);
+                  if (std::isfinite(sum) && (y <= Vec(-0.5)).zero_mask()) {
+                    // Retain 1 - exp(y) when the probability is close to one.
+                    auto difference = x - Vec(sum);
+                    result = Vec::blendv(
+                        result,
+                        difference - y.expm1() * Vec(sum),
+                        (y > Vec(-0.5)) &
+                            (difference.abs() < Vec(std::numeric_limits<at::opmath_type<scalar_t>>::infinity())));
+                  }
+                  return result;
+                },
                 grad_input_data,
                 grad_data,
                 output_data,
@@ -486,11 +498,22 @@ _vec_log_softmax_backward(
               Vec output_vec = Vec::loadu(output_ptr + d2);
               Vec sum_vec = Vec::loadu(tmp_sum_data + d2);
               Vec grad_input_vec = grad_output_vec - output_vec.exp() * sum_vec;
+              if ((output_vec <= Vec(-0.5)).zero_mask()) {
+                auto difference = grad_output_vec - sum_vec;
+                grad_input_vec = Vec::blendv(
+                    grad_input_vec,
+                    difference - output_vec.expm1() * sum_vec,
+                    (output_vec > Vec(-0.5)) &
+                        (difference.abs() < Vec(std::numeric_limits<scalar_t>::infinity())));
+              }
               grad_input_vec.store(grad_input_ptr + d2);
             }
             for (; d2 < size; d2++) {
-              grad_input_ptr[d2] = grad_output_ptr[d2] -
-                  std::exp(output_ptr[d2]) * tmp_sum_data[d2];
+              auto sum = tmp_sum_data[d2];
+              auto difference = grad_output_ptr[d2] - sum;
+              grad_input_ptr[d2] = output_ptr[d2] > -0.5 && std::isfinite(difference)
+                  ? difference - std::expm1(output_ptr[d2]) * sum
+                  : grad_output_ptr[d2] - std::exp(output_ptr[d2]) * sum;
             }
           }
         }
@@ -598,13 +621,33 @@ _vec_log_softmax_backward(
                   grad_output_fvec0 - output_fvec0.exp() * sum_fvec0;
               fVec grad_input_fvec1 =
                   grad_output_fvec1 - output_fvec1.exp() * sum_fvec1;
+              if ((output_fvec0 <= fVec(-0.5)).zero_mask()) {
+                auto difference = grad_output_fvec0 - sum_fvec0;
+                grad_input_fvec0 = fVec::blendv(
+                    grad_input_fvec0,
+                    difference - output_fvec0.expm1() * sum_fvec0,
+                    (output_fvec0 > fVec(-0.5)) &
+                        (difference.abs() < fVec(std::numeric_limits<float>::infinity())));
+              }
+              if ((output_fvec1 <= fVec(-0.5)).zero_mask()) {
+                auto difference = grad_output_fvec1 - sum_fvec1;
+                grad_input_fvec1 = fVec::blendv(
+                    grad_input_fvec1,
+                    difference - output_fvec1.expm1() * sum_fvec1,
+                    (output_fvec1 > fVec(-0.5)) &
+                        (difference.abs() < fVec(std::numeric_limits<float>::infinity())));
+              }
               Vec grad_input_vec =
                   vec::convert_from_float<scalar_t>(grad_input_fvec0, grad_input_fvec1);
               grad_input_vec.store(grad_input_ptr + d2);
             }
             for (; d2 < size; d2++) {
-              grad_input_ptr[d2] = grad_output_buffer_ptr[d2] -
-                  std::exp(float(output_ptr[d2])) * tmp_sum_data[d2];
+              auto sum = tmp_sum_data[d2];
+              auto output = float(output_ptr[d2]);
+              auto difference = grad_output_buffer_ptr[d2] - sum;
+              grad_input_ptr[d2] = output > -0.5 && std::isfinite(difference)
+                  ? difference - std::expm1(output) * sum
+                  : grad_output_buffer_ptr[d2] - std::exp(output) * sum;
             }
           }
         }

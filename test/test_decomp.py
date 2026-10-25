@@ -2,6 +2,7 @@
 
 import functools
 import itertools
+import math
 import re
 import unittest
 from collections import defaultdict
@@ -27,6 +28,7 @@ from torch.testing._internal.common_device_type import (
     onlyCPU,
     onlyCUDA,
     onlyNativeDeviceTypes,
+    onlyOn,
     ops,
     skip,
     skipOps,
@@ -37,6 +39,7 @@ from torch.testing._internal.common_modules import module_db, modules
 from torch.testing._internal.common_utils import (
     HardwareClassification,
     is_iterable_of_tensors,
+    parametrize,
     run_tests,
     skipIfCrossRef,
     skipIfTorchDynamo,
@@ -1347,6 +1350,48 @@ class DecompOneOffTests(TestCase):
         ref = torch.ops.aten._log_softmax(x, -1, False)
         res = torch._decomp.decompositions._log_softmax(x, -1, False)
         self.assertEqual(ref.stride(), res.stride())
+
+    @skipIfCrossRef
+    @onlyOn(["cpu", "cuda"])
+    @dtypes(torch.float32, torch.float64)
+    @parametrize("dim", [0, 1])
+    def test_log_softmax_no_collapse(self, device, dtype, dim):
+        from torch._decomp.decompositions import (
+            _log_softmax,
+            _log_softmax_backward_data,
+        )
+
+        margin = 25 if dtype == torch.float32 else 50
+        x = torch.tensor([[0, -margin, -margin]], device=device, dtype=dtype)
+        if dim == 0:
+            x = x.T
+        output = _log_softmax(x, dim, False)
+        grad_output = torch.zeros_like(x)
+        grad_output.select(dim, 0).fill_(-1)
+        grad = _log_softmax_backward_data(grad_output, output, dim, dtype)
+        tail = 2 * math.exp(-margin)
+        expected = torch.full_like(x, -margin - math.log1p(tail))
+        expected.select(dim, 0).fill_(-math.log1p(tail))
+        expected_grad = torch.full_like(x, math.exp(-margin) / (1 + tail))
+        expected_grad.select(dim, 0).fill_(-tail / (1 + tail))
+        self.assertEqual(output, expected, atol=0, rtol=2e-6)
+        self.assertEqual(grad, expected_grad, atol=0, rtol=2e-6)
+
+    @skipIfCrossRef
+    @onlyOn(["cpu", "cuda"])
+    def test_log_softmax_backward_large_upstream_grad(self, device):
+        from torch._decomp.decompositions import _log_softmax_backward_data
+
+        output = torch.tensor(
+            [[math.log(0.75), math.log(0.25), -float("inf")]], device=device
+        )
+        upstream = torch.tensor([[-1e38, 2e38, 2e38]], device=device)
+        actual = _log_softmax_backward_data(upstream, output, 1, torch.float32)
+        expected = upstream.double() - output.double().exp() * upstream.double().sum(
+            1, keepdim=True
+        )
+        self.assertTrue(expected.isfinite().all())
+        self.assertEqual(actual, expected.float())
 
     @onlyCUDA
     def test_exponential_non_inf(self, device):

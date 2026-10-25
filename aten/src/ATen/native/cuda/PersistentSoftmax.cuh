@@ -187,12 +187,31 @@ __global__ void softmax_warp_forward(output_t *dst, const input_t *src, int batc
     }
     warp_reduce<acc_t, WARP_BATCH, WARP_SIZE, Add>(sum);
 
+    if constexpr (is_log_softmax) {
+        acc_t tail[WARP_BATCH] { 0.0f };
+        for (int i = 0; i < WARP_BATCH; ++i) {
+            if (sum[i] != 1) continue;
+            for (int it = 0; it < WARP_ITERATIONS; ++it) {
+                int element_index = local_idx + it * WARP_SIZE;
+                if (element_index >= element_count) continue;
+                int mask_idx = it * WARP_SIZE + (is_transformer_mask ? 0 : i * element_count);
+                if ((!is_masked || !mask[mask_idx]) && elements[i][it] != max_value[i]) {
+                    tail[i] += std::exp(elements[i][it] - max_value[i]);
+                }
+            }
+        }
+        // Several logical warps can share one hardware warp.
+        warp_reduce<acc_t, WARP_BATCH, WARP_SIZE, Add>(tail);
+        for (int i = 0; i < WARP_BATCH; ++i) {
+            sum[i] = sum[i] == 1 ? std::log1p(tail[i]) : std::log(sum[i]);
+        }
+    }
+
     // store result
     #pragma unroll
     for (int i = 0;  i < WARP_BATCH;  ++i) {
         if (i >= local_batches)
             break;
-        if (is_log_softmax) sum[i] = std::log(sum[i]);
         #pragma unroll
         for (int it = 0;  it < WARP_ITERATIONS;  ++it) {
             int element_index = local_idx + it * WARP_SIZE;
@@ -288,7 +307,11 @@ __global__ void softmax_warp_backward(output_t *gradInput, const input_t *grad, 
                 }
                 // compute gradients
                 else if (is_log_softmax) {
-                    gradInput[i*element_count+it*WARP_SIZE] = (grad_reg[i][it] - std::exp(output_reg[i][it]) * sum[i]);
+                    auto value = output_reg[i][it];
+                    auto difference = grad_reg[i][it] - sum[i];
+                    gradInput[i*element_count+it*WARP_SIZE] = value > -0.5 && ::isfinite(difference)
+                        ? difference - std::expm1(value) * sum[i]
+                        : grad_reg[i][it] - std::exp(value) * sum[i];
                 } else {
                     gradInput[i*element_count+it*WARP_SIZE] = (grad_reg[i][it] - output_reg[i][it] * sum[i]);
                 }

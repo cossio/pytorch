@@ -38,6 +38,7 @@ constexpr int ALIGN_BYTES = 16;
 
 template<typename T, typename AccumT, typename OutT>
 struct LogSoftMaxForwardEpilogue {
+  static constexpr bool is_log_softmax = true;
   __device__ __forceinline__ LogSoftMaxForwardEpilogue(AccumT max_input, AccumT sum)
     : max_input(max_input),  logsum(std::log(sum)) {}
 
@@ -46,7 +47,7 @@ struct LogSoftMaxForwardEpilogue {
 }
 
   const AccumT max_input;
-  const AccumT logsum;
+  AccumT logsum;
 };
 
 template<typename T, typename AccumT, typename OutT>
@@ -55,6 +56,11 @@ struct LogSoftMaxBackwardEpilogue {
     : sum(sum) {}
 
   __device__ __forceinline__ T operator()(OutT gradOutput, OutT output) const {
+    auto value = static_cast<AccumT>(output);
+    auto difference = static_cast<AccumT>(gradOutput) - sum;
+    if (value > -0.5 && ::isfinite(difference)) {
+      return static_cast<T>(difference - std::expm1(value) * sum);
+    }
     return static_cast<T>(gradOutput - std::exp(static_cast<AccumT>(output)) * sum);
   }
 
@@ -63,6 +69,7 @@ struct LogSoftMaxBackwardEpilogue {
 
 template<typename T, typename AccumT, typename OutT>
 struct SoftMaxForwardEpilogue {
+  static constexpr bool is_log_softmax = false;
   __device__ __forceinline__ SoftMaxForwardEpilogue(AccumT max_input, AccumT sum)
     : max_input(max_input)
     , sum(sum) {}
@@ -321,6 +328,22 @@ __global__ void cunn_SpatialSoftMaxForward(
         sum = spatialBlockReduceX<accscalar_t, Add>(sdata, sum);
 
         Epilogue<scalar_t, accscalar_t, outscalar_t> epilogue(max_input, sum);
+        if constexpr (Epilogue<scalar_t, accscalar_t, outscalar_t>::is_log_softmax) {
+          accscalar_t tail = 0;
+          if (sum == 1) {
+            for (index_t d = threadIdx.x; d < dim_size; d += blockDim.x) {
+              auto value = static_cast<accscalar_t>(input[data_offset + d * dim_stride]);
+              if (value != max_input) {
+                tail += std::exp(value - max_input);
+              }
+            }
+          }
+          // The barrier must also be reached by rows whose sum is not one.
+          tail = spatialBlockReduceX<accscalar_t, Add>(sdata, tail);
+          if (sum == 1) {
+            epilogue.logsum = std::log1p(tail);
+          }
+        }
         for (index_t d = threadIdx.x; d < dim_size; d += blockDim.x)
           output[data_offset + d * dim_stride] = epilogue(input[data_offset + d * dim_stride]);
       } else {
@@ -334,6 +357,18 @@ __global__ void cunn_SpatialSoftMaxForward(
           sum += std::exp(static_cast<accscalar_t>(input[data_offset + d * dim_stride])
                  - max_input);
         Epilogue<scalar_t, accscalar_t, outscalar_t> epilogue(max_input, sum);
+        if constexpr (Epilogue<scalar_t, accscalar_t, outscalar_t>::is_log_softmax) {
+          if (sum == 1) {
+            accscalar_t tail = 0;
+            for (index_t d = 0; d < dim_size; d++) {
+              auto value = static_cast<accscalar_t>(input[data_offset + d * dim_stride]);
+              if (value != max_input) {
+                tail += std::exp(value - max_input);
+              }
+            }
+            epilogue.logsum = std::log1p(tail);
+          }
+        }
         for (index_t d = threadIdx.x; d < dim_size; d += blockDim.x)
           output[data_offset + d * dim_stride] = epilogue(input[data_offset + d * dim_stride]);
       }
@@ -494,6 +529,20 @@ T blockReduceWarp(T* smem_cache, T value, const Reduction<T>& op, T defaultVal)
   }
   __syncthreads();
   return smem_cache[0];
+}
+
+template <typename scalar_t, typename accscalar_t, typename index_t>
+__device__ accscalar_t log_softmax_tail(
+    const scalar_t* input, index_t classes, accscalar_t max_value, accscalar_t* sdata) {
+  accscalar_t tail = 0;
+  for (int64_t offset = threadIdx.x; offset < classes; offset += blockDim.x) {
+    auto value = static_cast<accscalar_t>(input[offset]);
+    if (value != max_value) {
+      tail += std::exp(value - max_value);
+    }
+  }
+  return blockReduceWarp<Add, accscalar_t>(
+      sdata, tail, Add<accscalar_t>(), accscalar_t(0));
 }
 
 
@@ -784,6 +833,12 @@ cunn_SoftMaxForward(outscalar_t *output, const scalar_t *input, int classes)
     Add<accscalar_t>(), static_cast<accscalar_t>(0));
 
   Epilogue<scalar_t, accscalar_t, outscalar_t> epilogue(max_k, sumAll);
+  if constexpr (Epilogue<scalar_t, accscalar_t, outscalar_t>::is_log_softmax) {
+    if (sumAll == 1) {
+      epilogue.logsum = std::log1p(log_softmax_tail(
+          input, classes, max_k, sdata));
+    }
+  }
 
   if (shift == output_shift) {
     WriteFpropResultsVectorized<ILP, scalar_t, accscalar_t, outscalar_t, Epilogue>(classes, shift, input, output, epilogue);
@@ -836,6 +891,12 @@ cunn_SoftMaxForwardReg(outscalar_t *output, const scalar_t *input, index_t class
     Add<accscalar_t>(), static_cast<accscalar_t>(0));
 
   Epilogue<scalar_t, accscalar_t, outscalar_t> epilogue(max_k, sumAll);
+  if constexpr (Epilogue<scalar_t, accscalar_t, outscalar_t>::is_log_softmax) {
+    if (sumAll == 1) {
+      epilogue.logsum = std::log1p(log_softmax_tail(
+          input, classes, max_k, sdata));
+    }
+  }
 
   // Write back the value
   #pragma unroll
@@ -964,6 +1025,12 @@ cunn_SoftMaxForwardSmem(outscalar_t *output, const scalar_t *input, index_t clas
     Add<accscalar_t>(), static_cast<accscalar_t>(0));
 
   Epilogue<scalar_t, accscalar_t, outscalar_t> epilogue(max_k, sumAll);
+  if constexpr (Epilogue<scalar_t, accscalar_t, outscalar_t>::is_log_softmax) {
+    if (sumAll == 1) {
+      epilogue.logsum = std::log1p(log_softmax_tail(
+          smem_input_cache, classes, max_k, smem_reduction_cache));
+    }
+  }
 
   // Use vectorized stores to save the output
   using StoreT = at::native::memory::aligned_vector<outscalar_t, ILP>;

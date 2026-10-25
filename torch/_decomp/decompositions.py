@@ -951,8 +951,12 @@ def _softmax_backward_data(
 def _log_softmax_backward_data(
     grad_output: Tensor, output: Tensor, dim: int, input_dtype: torch.dtype
 ):
-    grad_input = grad_output - torch.exp(output) * torch.sum(
-        grad_output, dim=dim, keepdim=True
+    sum_grad = torch.sum(grad_output, dim=dim, keepdim=True)
+    difference = grad_output - sum_grad
+    grad_input = torch.where(
+        (output > -0.5) & torch.isfinite(difference),
+        difference - torch.expm1(output) * sum_grad,
+        grad_output - torch.exp(output) * sum_grad,
     )
     return _cast_grad_to_input_dtype(grad_output, grad_input, input_dtype)
 
@@ -1391,7 +1395,12 @@ def _log_softmax(x: Tensor, dim: int, half_to_float: bool):
     x = x.to(computation_dtype)
     x_max = _softmax_unbacked_safe_amax(x, dim)
     shifted = x - x_max
-    shifted_logsumexp = torch.log(torch.sum(torch.exp(shifted), dim, keepdim=True))
+    unnormalized = torch.exp(shifted)
+    sum_exp = torch.sum(unnormalized, dim, keepdim=True)
+    # A sum rounded to one has a unique maximum. Keep its small tail
+    # separate so log(1 + tail) does not round to zero.
+    tail = torch.sum(torch.where(shifted == 0, 0, unnormalized), dim, keepdim=True)
+    shifted_logsumexp = torch.where(sum_exp == 1, torch.log1p(tail), torch.log(sum_exp))
     result = shifted - shifted_logsumexp
     if not half_to_float:
         result = result.to(result_dtype)

@@ -47,7 +47,7 @@ from torch.testing._internal.common_nn import NNTestCase, NewModuleTest, Criteri
     module_tests, criterion_tests, loss_reference_fns, _create_basic_net, \
     ctcloss_reference, get_new_module_tests, single_batch_reference_fn, _test_bfloat16_ops, _test_module_empty_input
 from torch.testing._internal.common_device_type import dtypesIfMPS, instantiate_device_type_tests, dtypes, \
-    dtypesIfCUDA, precisionOverride, onlyCUDA, onlyCPU, onlyAccelerator, \
+    dtypesIfCUDA, precisionOverride, onlyCUDA, onlyCPU, onlyAccelerator, onlyOn, \
     skipCUDAIf, skipCUDAIfMiopen, skipCUDAIfNoCudnn, skipCUDAIfNotRocm, largeMPSBufferTest, skipMPS, \
     onlyNativeDeviceTypes, deviceCountAtLeast, largeTensorTest, expectedFailureMeta, \
     expectedFailureMPS, skipMeta, get_all_device_types, skipCUDAIfNoSparseGeneric
@@ -10437,6 +10437,78 @@ class TestNNDeviceType(NNTestCase):
                         self.assertEqual(output, ref_output)
                         self.assertEqual(grad_input, ref_grad_input)
                         self.assertEqual(input.grad, ref_input.grad)
+
+    @onlyOn(["cpu", "cuda"])
+    @dtypes(torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    @parametrize_test("classes", [2, 3, 129, 2049, 32768])
+    @parametrize_test("spatial", [False, True])
+    def test_log_softmax_no_collapse(self, device, dtype, classes, spatial):
+        margin = {torch.float16: 17, torch.bfloat16: 25,
+                  torch.float32: 25, torch.float64: 50}[dtype]
+        if dtype != torch.float16:
+            # Keep the total tail below epsilon as the vocabulary grows.
+            margin += math.ceil(math.log(classes))
+        shape = (2, classes, 3) if spatial else (2, classes)
+        logits = torch.full(shape, -margin, device=device, dtype=dtype)
+        if dtype == torch.float16:
+            # Keep one representable subnormal tail, even for a large vocabulary.
+            logits.fill_(-float("inf"))
+            logits[:, 0] = -margin
+        # The maximum need not be the first class.
+        target_class = classes // 2
+        logits[:, target_class] = 0
+        logits.requires_grad_()
+        target = torch.full(shape[:1] + shape[2:], target_class, device=device, dtype=torch.long)
+
+        tail = (1 if dtype == torch.float16 else classes - 1) * math.exp(-margin)
+        expected_loss = math.log1p(tail)
+        log_probs = F.log_softmax(logits, dim=1)
+        loss = F.cross_entropy(logits, target, reduction="none")
+        grad, = torch.autograd.grad(loss.sum(), logits)
+        rtol = {torch.float16: 0.02, torch.bfloat16: 0.02,
+                torch.float32: 5e-4, torch.float64: 1e-12}[dtype]
+        expected = torch.full_like(log_probs[:, target_class], -expected_loss)
+        self.assertEqual(log_probs[:, target_class], expected, atol=0, rtol=rtol)
+        self.assertEqual(loss, torch.full_like(loss, expected_loss), atol=0, rtol=rtol)
+        expected_grad = torch.full_like(grad, tail / ((classes - 1) * (1 + tail)))
+        if dtype == torch.float16:
+            expected_grad.zero_()
+            expected_grad[:, 0] = tail / (1 + tail)
+        expected_grad[:, target_class] = -tail / (1 + tail)
+        self.assertEqual(grad, expected_grad, atol=0, rtol=rtol)
+        self.assertTrue((grad[:, target_class] < 0).all())
+
+    @onlyOn(["cpu", "cuda"])
+    @parametrize_test("spatial", [False, True])
+    @parametrize_test("classes", [3, 129])
+    def test_log_softmax_mixed_collapse(self, device, spatial, classes):
+        logits = torch.zeros((2, classes, 3) if spatial else (2, classes), device=device)
+        confident = logits[:, :, 0] if spatial else logits[:1]
+        confident.fill_(-50)
+        confident[:, 0] = 0
+        logits.requires_grad_()
+        output = F.log_softmax(logits, dim=1)
+        expected = torch.full_like(logits, -math.log(classes))
+        expected_confident = expected[:, :, 0] if spatial else expected[:1]
+        tail = (classes - 1) * math.exp(-50)
+        expected_confident.fill_(-50 - math.log1p(tail))
+        expected_confident[:, 0] = -math.log1p(tail)
+        self.assertEqual(output, expected, atol=0, rtol=2e-5)
+
+    @onlyOn(["cpu", "cuda"])
+    @parametrize_test("spatial", [False, True])
+    def test_log_softmax_large_upstream_grad(self, device, spatial):
+        logits = torch.tensor([[math.log(3), 0, -float("inf")]], device=device)
+        upstream = torch.tensor([[-1e38, 2e38, 2e38]], device=device)
+        if spatial:
+            logits = logits.unsqueeze(-1).expand(-1, -1, 3).contiguous()
+            upstream = upstream.unsqueeze(-1).expand_as(logits).contiguous()
+        logits.requires_grad_()
+        ref = logits.detach().double().requires_grad_()
+        actual, = torch.autograd.grad(F.log_softmax(logits, 1), logits, upstream)
+        expected, = torch.autograd.grad(F.log_softmax(ref, 1), ref, upstream.double())
+        self.assertTrue(expected.isfinite().all())
+        self.assertEqual(actual, expected.float())
 
     @onlyAccelerator
     @dtypes(torch.half)
