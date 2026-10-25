@@ -30,6 +30,14 @@ struct Max {
   }
 };
 
+template <typename T>
+__device__ __forceinline__ T log_softmax_backward(T grad_output, T output, T sum) {
+    auto difference = grad_output - sum;
+    return output > -0.5 && ::isfinite(difference)
+        ? difference - std::expm1(output) * sum
+        : grad_output - std::exp(output) * sum;
+}
+
 template <typename acc_t, int WARP_BATCH, int WARP_SIZE, template<typename> class ReduceOp>
 __device__ __forceinline__ void warp_reduce(acc_t* sum) {
     ReduceOp<acc_t> r;
@@ -307,11 +315,8 @@ __global__ void softmax_warp_backward(output_t *gradInput, const input_t *grad, 
                 }
                 // compute gradients
                 else if (is_log_softmax) {
-                    auto value = output_reg[i][it];
-                    auto difference = grad_reg[i][it] - sum[i];
-                    gradInput[i*element_count+it*WARP_SIZE] = value > -0.5 && ::isfinite(difference)
-                        ? difference - std::expm1(value) * sum[i]
-                        : grad_reg[i][it] - std::exp(value) * sum[i];
+                    gradInput[i*element_count+it*WARP_SIZE] = log_softmax_backward(
+                        grad_reg[i][it], output_reg[i][it], sum[i]);
                 } else {
                     gradInput[i*element_count+it*WARP_SIZE] = (grad_reg[i][it] - output_reg[i][it] * sum[i]);
                 }

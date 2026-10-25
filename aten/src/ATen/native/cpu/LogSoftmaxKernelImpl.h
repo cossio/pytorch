@@ -32,6 +32,7 @@ void correct_log_softmax_normalizer(
     const scalar_t* input,
     const scalar_t* max_data,
     scalar_t* log_sum_data,
+    scalar_t* tail,
     int64_t dim_size,
     int64_t stride,
     int64_t size) {
@@ -39,22 +40,13 @@ void correct_log_softmax_normalizer(
     return;
   }
   using Vec = vec::Vectorized<scalar_t>;
-  auto tail = std::make_unique<scalar_t[]>(size);
+  std::fill_n(tail, size, scalar_t(0));
   for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {
-    const auto* values = input + dim_idx * stride;
-    int64_t d = 0;
-    for (; d < size - (size % Vec::size()); d += Vec::size()) {
-      auto value = Vec::loadu(values + d);
-      auto max = Vec::loadu(max_data + d);
-      auto sum = Vec::loadu(tail.get() + d);
-      sum += Vec::blendv((value - max).exp(), Vec(0), value == max);
-      sum.store(tail.get() + d);
-    }
-    for (; d < size; d++) {
-      if (values[d] != max_data[d]) {
-        tail[d] += std::exp(values[d] - max_data[d]);
-      }
-    }
+    vec::map3(
+        [](Vec sum, Vec value, Vec max) {
+          return sum + Vec::blendv((value - max).exp(), Vec(0), value == max);
+        },
+        tail, tail, input + dim_idx * stride, max_data, size);
   }
   vec::map2(
       [](Vec log_sum, Vec tail_sum) {
@@ -62,7 +54,7 @@ void correct_log_softmax_normalizer(
       },
       log_sum_data,
       log_sum_data,
-      tail.get(),
+      tail,
       size);
 }
 
@@ -177,10 +169,11 @@ serial_vec_logsoftmax_range(
     int64_t begin,
     int64_t end) {
   using Vec = vec::Vectorized<scalar_t>;
-  // thread local temp buffer which holds vertical reduction result: max and sum.
-  auto buffer = std::make_unique<scalar_t []>(chunk_size * 2);
+  // thread local temp buffer for the maximum, sum, and non-maximum tail.
+  auto buffer = std::make_unique<scalar_t []>(chunk_size * 3);
   scalar_t* input_max_data = buffer.get();
   scalar_t* tmp_sum_data = buffer.get() + chunk_size;
+  scalar_t* tail_data = buffer.get() + chunk_size * 2;
 
   for (int64_t i = begin; i < end; i++) {
     int64_t outer_idx = i / num_chunks;
@@ -245,7 +238,7 @@ serial_vec_logsoftmax_range(
 
     correct_log_softmax_normalizer(
         input_data_base + outer_idx * dim_size * inner_size + inner_idx_begin,
-        input_max_data, tmp_sum_data, dim_size, inner_size, size);
+        input_max_data, tmp_sum_data, tail_data, dim_size, inner_size, size);
 
     // compute x - max - sum
     for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {
@@ -281,9 +274,10 @@ serial_vec_logsoftmax_range(
     int64_t end) {
   using Vec = vec::Vectorized<scalar_t>;
   using fVec = vec::Vectorized<float>;
-  auto buffer = std::make_unique<float []>(chunk_size * 2);
+  auto buffer = std::make_unique<float []>(chunk_size * 3);
   float* input_max_data = buffer.get();
   float* tmp_sum_data = buffer.get() + chunk_size;
+  float* tail_data = buffer.get() + chunk_size * 2;
 
   // thread local buffer that holds input data in float32 to save next 2 dtype conversion
   auto input_buffer = std::make_unique<float []>(dim_size * chunk_size);
@@ -367,7 +361,7 @@ serial_vec_logsoftmax_range(
     vec::map([](fVec x) { return x.log(); }, tmp_sum_data, tmp_sum_data, size);
 
     correct_log_softmax_normalizer(
-        input_buffer_data, input_max_data, tmp_sum_data, dim_size, chunk_size, size);
+        input_buffer_data, input_max_data, tmp_sum_data, tail_data, dim_size, chunk_size, size);
 
     // compute x - max - sum
     for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {

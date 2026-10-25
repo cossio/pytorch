@@ -158,6 +158,32 @@ _vec_softmax_lastdim(
   });
 }
 
+template <typename T>
+inline vec::Vectorized<T> log_softmax_backward(
+    vec::Vectorized<T> grad_output,
+    vec::Vectorized<T> output,
+    vec::Vectorized<T> sum) {
+  using Vec = vec::Vectorized<T>;
+  auto grad_input = grad_output - output.exp() * sum;
+  if ((output <= Vec(-0.5)).zero_mask()) {
+    // Retain 1 - exp(output) when the probability is close to one.
+    auto difference = grad_output - sum;
+    auto mask = (output > Vec(-0.5)) &
+        (difference.abs() < Vec(std::numeric_limits<T>::infinity()));
+    grad_input = Vec::blendv(
+        grad_input, difference - output.expm1() * sum, mask);
+  }
+  return grad_input;
+}
+
+template <typename T>
+inline T log_softmax_backward(T grad_output, T output, T sum) {
+  auto difference = grad_output - sum;
+  return output > -0.5 && std::isfinite(difference)
+      ? difference - std::expm1(output) * sum
+      : grad_output - std::exp(output) * sum;
+}
+
 template <typename scalar_t, bool log_softmax>
 inline void _vec_host_softmax_backward_lastdim(
     scalar_t* grad_input_data_base,
@@ -181,17 +207,7 @@ inline void _vec_host_softmax_backward_lastdim(
                 [](Vec& x, Vec& y) { return x + y; }, grad_data, dim_size);
             vec::map2(
                 [sum](Vec x, Vec y) {
-                  auto result = x - y.exp() * Vec(sum);
-                  if (std::isfinite(sum) && (y <= Vec(-0.5)).zero_mask()) {
-                    // Retain 1 - exp(y) when the probability is close to one.
-                    auto difference = x - Vec(sum);
-                    result = Vec::blendv(
-                        result,
-                        difference - y.expm1() * Vec(sum),
-                        (y > Vec(-0.5)) &
-                            (difference.abs() < Vec(std::numeric_limits<at::opmath_type<scalar_t>>::infinity())));
-                  }
-                  return result;
+                  return log_softmax_backward(x, y, Vec(sum));
                 },
                 grad_input_data,
                 grad_data,
@@ -497,23 +513,12 @@ _vec_log_softmax_backward(
               Vec grad_output_vec = Vec::loadu(grad_output_ptr + d2);
               Vec output_vec = Vec::loadu(output_ptr + d2);
               Vec sum_vec = Vec::loadu(tmp_sum_data + d2);
-              Vec grad_input_vec = grad_output_vec - output_vec.exp() * sum_vec;
-              if ((output_vec <= Vec(-0.5)).zero_mask()) {
-                auto difference = grad_output_vec - sum_vec;
-                grad_input_vec = Vec::blendv(
-                    grad_input_vec,
-                    difference - output_vec.expm1() * sum_vec,
-                    (output_vec > Vec(-0.5)) &
-                        (difference.abs() < Vec(std::numeric_limits<scalar_t>::infinity())));
-              }
+              Vec grad_input_vec = log_softmax_backward(grad_output_vec, output_vec, sum_vec);
               grad_input_vec.store(grad_input_ptr + d2);
             }
             for (; d2 < size; d2++) {
-              auto sum = tmp_sum_data[d2];
-              auto difference = grad_output_ptr[d2] - sum;
-              grad_input_ptr[d2] = output_ptr[d2] > -0.5 && std::isfinite(difference)
-                  ? difference - std::expm1(output_ptr[d2]) * sum
-                  : grad_output_ptr[d2] - std::exp(output_ptr[d2]) * sum;
+              grad_input_ptr[d2] = log_softmax_backward(
+                  grad_output_ptr[d2], output_ptr[d2], tmp_sum_data[d2]);
             }
           }
         }
@@ -617,37 +622,15 @@ _vec_log_softmax_backward(
               fVec grad_output_fvec0 = fVec::loadu(grad_output_buffer_ptr + d2);
               fVec grad_output_fvec1 =
                   fVec::loadu(grad_output_buffer_ptr + d2 + fVec::size());
-              fVec grad_input_fvec0 =
-                  grad_output_fvec0 - output_fvec0.exp() * sum_fvec0;
-              fVec grad_input_fvec1 =
-                  grad_output_fvec1 - output_fvec1.exp() * sum_fvec1;
-              if ((output_fvec0 <= fVec(-0.5)).zero_mask()) {
-                auto difference = grad_output_fvec0 - sum_fvec0;
-                grad_input_fvec0 = fVec::blendv(
-                    grad_input_fvec0,
-                    difference - output_fvec0.expm1() * sum_fvec0,
-                    (output_fvec0 > fVec(-0.5)) &
-                        (difference.abs() < fVec(std::numeric_limits<float>::infinity())));
-              }
-              if ((output_fvec1 <= fVec(-0.5)).zero_mask()) {
-                auto difference = grad_output_fvec1 - sum_fvec1;
-                grad_input_fvec1 = fVec::blendv(
-                    grad_input_fvec1,
-                    difference - output_fvec1.expm1() * sum_fvec1,
-                    (output_fvec1 > fVec(-0.5)) &
-                        (difference.abs() < fVec(std::numeric_limits<float>::infinity())));
-              }
+              fVec grad_input_fvec0 = log_softmax_backward(grad_output_fvec0, output_fvec0, sum_fvec0);
+              fVec grad_input_fvec1 = log_softmax_backward(grad_output_fvec1, output_fvec1, sum_fvec1);
               Vec grad_input_vec =
                   vec::convert_from_float<scalar_t>(grad_input_fvec0, grad_input_fvec1);
               grad_input_vec.store(grad_input_ptr + d2);
             }
             for (; d2 < size; d2++) {
-              auto sum = tmp_sum_data[d2];
-              auto output = float(output_ptr[d2]);
-              auto difference = grad_output_buffer_ptr[d2] - sum;
-              grad_input_ptr[d2] = output > -0.5 && std::isfinite(difference)
-                  ? difference - std::expm1(output) * sum
-                  : grad_output_buffer_ptr[d2] - std::exp(output) * sum;
+              grad_input_ptr[d2] = log_softmax_backward(
+                  grad_output_buffer_ptr[d2], float(output_ptr[d2]), tmp_sum_data[d2]);
             }
           }
         }
